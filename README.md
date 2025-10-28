@@ -1,4 +1,4 @@
-# miniserv
+# mini-serv
 42 exam prep
 練習用
 
