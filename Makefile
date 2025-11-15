@@ -19,4 +19,8 @@ run: $(NAME)
 	@echo "== Running mini_serv =="
 	./$(NAME) 8080
 
-.PHONY: all clean fclean re
+test: $(NAME)
+	@echo "== Running mini_serv under leak check =="
+	valgrind --leak-check=full --track-fds=yes ./$(NAME) 8080
+
+.PHONY: all clean fclean re run test

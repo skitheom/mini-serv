@@ -1,6 +1,5 @@
 
 #include <arpa/inet.h>
-#include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -12,66 +11,199 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/*
+Allowed functions:
+write, close, select, socket, accept, listen, send, recv, bind, strstr, malloc,
+realloc, free, calloc, bzero, atoi, sprintf, strlen, exit, strcpy, strcat,
+memset, htonl, htons
+*/
+
 static const char *ERR_ARGC = "Wrong number of arguments\n";
 static const char *ERR_FATAL = "Fatal error\n";
-static const char *MSG_CLIENT_ARRIVAL = "server: client %d just arrived\n";
-static const char *MSG_CLIENT_LEAVE = "server: client %d just left\n";
-static const char *MSG_PREFIX = "client %d: ";
-
-static fd_set g_main_fds;
-static int g_fdmax;
-static int g_listener;
-static struct s_client *g_clients;
+static const char *MSG_ARRIVAL = "server: client %d just arrived\n";
+static const char *MSG_LEAVE = "server: client %d just left\n";
+static const char *MSG_FORMAT = "client %d: %s"; // %sは`\n`で終わるはず
 
 typedef struct s_client {
   int id;
-  char *buf; // 書きたいデータをためる
+  char *inbuf;  // partialだった（\nが未達）のデータを貯める
+  char *outbuf; // 書きたいデータをためる
 } t_client;
 
-// ---------- Utility ----------
+t_client g_clients[FD_SETSIZE];
+int g_server_fd = -1;
+int g_fdmax = -1;
+fd_set g_main_fds;
 
-void err_msg(const char *msg) { write(2, msg, strlen(msg)); }
+////////////////////////////////////////////////////////////
+// 配布 code
 
-void fatal(void) {
-  err_msg(ERR_FATAL);
-  exit(1);
+int extract_message(char **buf, char **msg) {
+  char *newbuf;
+  int i;
+
+  *msg = 0;
+  if (*buf == 0)
+    return (0);
+  i = 0;
+  while ((*buf)[i]) {
+    if ((*buf)[i] == '\n') {
+      newbuf = calloc(1, sizeof(*newbuf) * (strlen(*buf + i + 1) + 1));
+      if (newbuf == 0)
+        return (-1);
+      strcpy(newbuf, *buf + i + 1);
+      *msg = *buf;
+      (*msg)[i + 1] = 0;
+      *buf = newbuf;
+      return (1);
+    }
+    i++;
+  }
+  return (0);
+}
+
+char *str_join(char *buf, char *add) {
+  char *newbuf;
+  int len;
+
+  if (buf == 0)
+    len = 0;
+  else
+    len = strlen(buf);
+  newbuf = malloc(sizeof(*newbuf) * (len + strlen(add) + 1));
+  if (newbuf == 0)
+    return (0);
+  newbuf[0] = 0;
+  if (buf != 0)
+    strcat(newbuf, buf);
+  free(buf);
+  strcat(newbuf, add);
+  return (newbuf);
+}
+
+////////////////////////////////////////////////////////////
+// Error and clean up
+
+void err_msg(const char *msg) {
+  if (msg)
+    write(2, msg, strlen(msg));
 }
 
 void clean_up() {
+
   for (int fd = 0; fd < FD_SETSIZE; ++fd) {
     if (g_clients[fd].id != -1) {
       close(fd);
     }
-    if (g_clients[fd].buf) {
-      free(g_clients[fd].buf);
-      g_clients[fd].buf = 0;
+    if (g_clients[fd].inbuf) {
+      free(g_clients[fd].inbuf);
+    }
+    if (g_clients[fd].outbuf) {
+      free(g_clients[fd].outbuf);
     }
   }
-  free(g_clients);
-  close(g_listener);
+
+  if (g_server_fd != -1) {
+    close(g_server_fd);
+  }
+  FD_ZERO(&g_main_fds);
 }
+
+void fatal(void) {
+  err_msg(ERR_FATAL);
+  clean_up();
+  exit(1);
+}
+
+////////////////////////////////////////////////////////////
+// Utility
 
 char *xcalloc(size_t count, size_t size) {
   if (count == 0 || size == 0) {
-    clean_up();
-    fatal();
+    count = 1;
+    size = 1;
   }
   char *ptr = calloc(count, size);
   if (!ptr) {
-    clean_up();
     fatal();
   }
   return ptr;
 }
 
-uint16_t ft_htons(uint16_t x) { return (x >> 8) | (x << 8); }
-
-uint32_t ft_htonl(uint32_t x) {
-  return ((x >> 24) & 0x000000FF) | ((x >> 8) & 0x0000FF00) |
-         ((x << 8) & 0x00FF0000) | ((x << 24) & 0xFF000000);
+char *xrealloc(char **ptr, size_t size) {
+  if (size == 0) {
+    size = 1;
+  }
+  char *tmp = realloc(*ptr, size);
+  if (!tmp) {
+    fatal();
+  }
+  *ptr = tmp;
+  return tmp;
 }
 
-// ---------- fd_set Management ----------
+////////////////////////////////////////////////////////////
+//  Messaging
+
+bool is_valid_clientfd(int fd) {
+  return (fd >= 0 && fd < FD_SETSIZE && g_clients[fd].id != -1);
+}
+
+void broadcast_msg(char *msg, int exclude_fd) {
+  if (!msg || !*msg || !is_valid_clientfd(exclude_fd)) {
+    return;
+  }
+  for (int fd = 0; fd <= g_fdmax; ++fd) {
+    if (fd == g_server_fd || fd == exclude_fd || g_clients[fd].id == -1) {
+      continue;
+    }
+    char *joined_msg = str_join(g_clients[fd].outbuf, msg);
+    if (!joined_msg) {
+      fatal();
+    }
+    g_clients[fd].outbuf = joined_msg;
+  }
+}
+
+void build_client_msg(const char *new_buf, int fd) {
+  if (!new_buf || !*new_buf || !is_valid_clientfd(fd)) {
+    return;
+  }
+  char *inbuf = str_join(g_clients[fd].inbuf, (char *)new_buf);
+  if (!inbuf) {
+    fatal();
+  }
+  g_clients[fd].inbuf = 0; // double free 防止
+  while (true) {
+    char *msg = 0;
+    int result = extract_message(&inbuf, &msg);
+    if (result == -1) {
+      fatal();
+    }
+    if (result == 0) {
+      break;
+    }
+    char *client_msg = (char *)xcalloc(1, strlen(msg) + 30);
+    sprintf(client_msg, MSG_FORMAT, g_clients[fd].id, msg);
+    broadcast_msg(client_msg, fd);
+    free(msg);
+    free(client_msg);
+  }
+  g_clients[fd].inbuf = inbuf;
+}
+
+void build_system_msg(const char *msg, int fd) {
+  if (!msg || !*msg || !is_valid_clientfd(fd)) {
+    return;
+  }
+  char *system_msg = (char *)xcalloc(1, strlen(msg) + 13);
+  sprintf(system_msg, msg, g_clients[fd].id);
+  broadcast_msg(system_msg, fd);
+  free(system_msg);
+}
+
+////////////////////////////////////////////////////////////
+// fd_set Management
 
 void monitor(int fd) {
   FD_SET(fd, &g_main_fds);
@@ -92,190 +224,103 @@ void unmonitor(int fd) {
   }
 }
 
-// ---------- Messaging ----------
+////////////////////////////////////////////////////////////
+//  Client Management
 
-void broadcast(const char *msg, int client_fd) {
-  if (!msg || client_fd < 0 || client_fd >= FD_SETSIZE) {
+void add_client(int client_fd) {
+  if (client_fd < 0 || client_fd >= FD_SETSIZE) {
     return;
   }
-  char *new_msg = (char *)xcalloc(1, strlen(msg) + 11);
-  int new_len = sprintf(new_msg, msg, g_clients[client_fd].id);
-
-  for (int fd = 0; fd < g_fdmax + 1; ++fd) {
-    if (fd == g_listener || fd == client_fd || g_clients[fd].id == -1) {
-      continue;
-    }
-    if (!g_clients[fd].buf) {
-      g_clients[fd].buf = (char *)xcalloc(1, new_len + 1);
-      strcpy(g_clients[fd].buf, new_msg);
-    } else {
-      int joined_len = strlen(g_clients[fd].buf) + new_len;
-      char *joined_buf = (char *)xcalloc(1, joined_len + 1);
-      strcpy(joined_buf, g_clients[fd].buf);
-      strcat(joined_buf, new_msg);
-      free(g_clients[fd].buf);
-      g_clients[fd].buf = joined_buf;
-    }
-  }
-  free(new_msg);
-}
-
-void broadcast_client_msg(const char *msg, int client_fd) {
-  if (!msg || client_fd < 0 || client_fd >= FD_SETSIZE) {
-    return;
-  }
-  char *new_msg = (char *)xcalloc(1, strlen(MSG_PREFIX) + strlen(msg) + 11);
-  sprintf(new_msg, MSG_PREFIX, g_clients[client_fd].id);
-  strcat(new_msg, msg);
-  int new_len = strlen(new_msg);
-
-  for (int fd = 0; fd < g_fdmax + 1; ++fd) {
-    if (fd == g_listener || fd == client_fd || g_clients[fd].id == -1) {
-      continue;
-    }
-    if (!g_clients[fd].buf) {
-      g_clients[fd].buf = (char *)xcalloc(1, new_len + 1);
-      strcpy(g_clients[fd].buf, new_msg);
-    } else {
-      int joined_len = strlen(g_clients[fd].buf) + new_len;
-      char *joined_buf = (char *)xcalloc(1, joined_len + 1);
-      strcpy(joined_buf, g_clients[fd].buf);
-      strcat(joined_buf, new_msg);
-      free(g_clients[fd].buf);
-      g_clients[fd].buf = joined_buf;
-    }
-  }
-  free(new_msg);
-}
-
-// ---------- Client Management ----------
-
-void add_to_clients(int client_fd) {
   static int next_client_id = 0;
-  if (client_fd < 0 || client_fd >= FD_SETSIZE) {
-    return;
-  }
   g_clients[client_fd].id = next_client_id++;
-  g_clients[client_fd].buf = 0;
-  broadcast(MSG_CLIENT_ARRIVAL, client_fd);
+  g_clients[client_fd].inbuf = 0;
+  g_clients[client_fd].outbuf = 0;
+  build_system_msg(MSG_ARRIVAL, client_fd);
 }
 
-void remove_from_client(int client_fd) {
-  if (client_fd < 0 || client_fd >= FD_SETSIZE) {
+void remove_client(int client_fd) {
+  if (!is_valid_clientfd(client_fd)) {
     return;
   }
-  broadcast(MSG_CLIENT_LEAVE, client_fd);
-  g_clients[client_fd].id = -1;
-  if (g_clients[client_fd].buf) {
-    free(g_clients[client_fd].buf);
-    g_clients[client_fd].buf = 0;
-  }
+  build_system_msg(MSG_LEAVE, client_fd);
   close(client_fd);
-}
-
-void send_to_client(int fd) {
-  if (fd < 0 || fd >= FD_SETSIZE || g_clients[fd].id == -1 ||
-      !g_clients[fd].buf) {
-    return;
+  g_clients[client_fd].id = -1;
+  if (g_clients[client_fd].inbuf) {
+    free(g_clients[client_fd].inbuf);
+    g_clients[client_fd].inbuf = 0;
   }
-  ssize_t buf_len = strlen(g_clients[fd].buf);
-  ssize_t bytes_sent = send(fd, g_clients[fd].buf, buf_len, 0);
-  if (bytes_sent <= 0) {
-    remove_from_client(fd);
-    unmonitor(fd);
-    return;
-  }
-  if (bytes_sent >= buf_len) { // or rv == buf_len ?
-    free(g_clients[fd].buf);
-    g_clients[fd].buf = 0;
-    return;
-  }
-
-  // partial write
-  if (bytes_sent < buf_len) {
-    char *buf = (char *)xcalloc(1, buf_len - bytes_sent + 1);
-    strcpy(buf, g_clients[fd].buf + bytes_sent);
-    free(g_clients[fd].buf);
-    g_clients[fd].buf = buf;
+  if (g_clients[client_fd].outbuf) {
+    free(g_clients[client_fd].outbuf);
+    g_clients[client_fd].outbuf = 0;
   }
 }
-
-void read_from_client(int client_fd) {
-  char buf[1024] = {0};
-  ssize_t bytes_read = recv(client_fd, buf, sizeof(buf), 0);
-  if (bytes_read == -1) {
-    if (errno == EAGAIN || errno == EINTR) {
-      return;
-    }
-    remove_from_client(client_fd);
-    unmonitor(client_fd);
-    return;
-  }
-  if (bytes_read == 0) {
-    remove_from_client(client_fd);
-    unmonitor(client_fd);
-    return;
-  }
-  broadcast_client_msg(buf, client_fd);
-}
-
-// ---------- Connection ----------
 
 void accept_client() {
-  struct sockaddr_storage client_addr;
-  socklen_t addrlen = sizeof(client_addr);
-  int client_fd = accept(g_listener, (struct sockaddr *)&client_addr, &addrlen);
-  if (client_fd < 0) {
-    clean_up();
-    fatal();
+
+  int client_fd = accept(g_server_fd, 0, 0);
+  if (client_fd == -1) {
+    return;
   }
   if (client_fd >= FD_SETSIZE) {
     close(client_fd);
     return;
   }
-  add_to_clients(client_fd);
+  add_client(client_fd);
   monitor(client_fd);
 }
 
-int launch_listener(uint16_t portnum) {
-
-  struct sockaddr_in servaddr;
-
-  memset(&servaddr, 0, sizeof(servaddr));
-  servaddr.sin_family = AF_INET;
-  servaddr.sin_port = ft_htons(portnum);
-  servaddr.sin_addr.s_addr = ft_htonl(INADDR_LOOPBACK);
-
-  int listener = socket(AF_INET, SOCK_STREAM, 0);
-  if (listener < 0) {
-    fatal();
+void read_from_client(int fd) {
+  if (fd < 0 || fd >= FD_SETSIZE || g_clients[fd].id == -1) {
+    return;
   }
-  if (bind(listener, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-    close(listener);
-    fatal();
+  char buf[4096 + 1];
+  ssize_t n = recv(fd, buf, 4096, 0);
+  if (n <= 0) {
+    remove_client(fd);
+    unmonitor(fd);
+    return;
   }
-  if (listen(listener, 10) < 0) {
-    close(listener);
-    fatal();
-  }
-  return listener;
+  buf[n] = '\0';
+  build_client_msg(buf, fd);
 }
 
-// ---------- Select Loop ----------
-
-void register_write_ready_clients(fd_set *write_fds) {
-  for (int fd = 0; fd <= g_fdmax; ++fd) {
-    if (g_clients[fd].id != -1 && g_clients[fd].buf) {
-      FD_SET(fd, write_fds);
-    }
+void send_to_client(int fd) {
+  if (fd < 0 || fd >= FD_SETSIZE || g_clients[fd].id == -1 ||
+      !g_clients[fd].outbuf) {
+    return;
   }
+  ssize_t buf_len = strlen(g_clients[fd].outbuf);
+  ssize_t bytes_sent = send(fd, g_clients[fd].outbuf, buf_len, 0);
+  if (bytes_sent < 0) {
+    remove_client(fd);
+    unmonitor(fd);
+    return;
+  }
+  if (bytes_sent == 0) {
+    return;
+  }
+
+  // if bytes_sent > 0
+  // partial write
+  if (bytes_sent < buf_len) {
+    char *dst = (char *)xcalloc(1, buf_len - bytes_sent + 1);
+    strcpy(dst, g_clients[fd].outbuf + bytes_sent);
+    free(g_clients[fd].outbuf);
+    g_clients[fd].outbuf = dst;
+    return;
+  }
+  free(g_clients[fd].outbuf);
+  g_clients[fd].outbuf = 0;
 }
 
-void handle_fd_events(int fd, bool is_readable, bool is_writable) {
+////////////////////////////////////////////////////////////
+//  Select Loop
+
+void handle_events(int fd, bool is_readable, bool is_writable) {
   if (!is_readable && !is_writable) {
     return;
   }
-  if (fd == g_listener) {
+  if (fd == g_server_fd) {
     if (is_readable) {
       accept_client();
     }
@@ -290,49 +335,76 @@ void handle_fd_events(int fd, bool is_readable, bool is_writable) {
 }
 
 void select_loop() {
-  fd_set read_fds, write_fds;
-
+  // add listening fd
   FD_ZERO(&g_main_fds);
-  FD_ZERO(&read_fds);
-  FD_ZERO(&write_fds);
-  FD_SET(g_listener, &g_main_fds);
-  g_fdmax = g_listener;
+  FD_SET(g_server_fd, &g_main_fds);
+  g_fdmax = g_server_fd;
 
   while (1) {
-    read_fds = g_main_fds;
+    fd_set read_fds, write_fds;
+
+    FD_ZERO(&read_fds);
     FD_ZERO(&write_fds);
-    register_write_ready_clients(&write_fds);
-    errno = 0;
-    if (select(g_fdmax + 1, &read_fds, &write_fds, 0, 0) == -1) {
-      if (errno == EINTR) {
+    read_fds = g_main_fds;
+    for (int fd = 0; fd <= g_fdmax; ++fd) {
+      if (g_clients[fd].id == -1 || !FD_ISSET(fd, &g_main_fds)) {
         continue;
       }
-      clean_up();
+      if (g_clients[fd].outbuf) {
+        FD_SET(fd, &write_fds);
+      }
+    }
+
+    if (select(g_fdmax + 1, &read_fds, &write_fds, 0, 0) == -1) {
       fatal();
     }
     for (int fd = 0; fd <= g_fdmax; ++fd) {
-      handle_fd_events(fd, FD_ISSET(fd, &read_fds), FD_ISSET(fd, &write_fds));
+      handle_events(fd, FD_ISSET(fd, &read_fds), FD_ISSET(fd, &write_fds));
     }
   }
 }
 
-// ---------- Entry Point ----------
+////////////////////////////////////////////////////////////
+//  Init Server & Clients
+
+static void server_init(uint16_t port) {
+  struct sockaddr_in addr;
+
+  bzero(&addr, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(port);
+
+  g_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (g_server_fd == -1) {
+    fatal();
+  }
+  if (bind(g_server_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+    fatal();
+  }
+  if (listen(g_server_fd, 128) == -1) {
+    fatal();
+  }
+}
+
+static void clients_init(void) {
+  for (int fd = 0; fd < FD_SETSIZE; ++fd) {
+    g_clients[fd].id = -1;
+    g_clients[fd].inbuf = NULL;
+    g_clients[fd].outbuf = NULL;
+  }
+}
+
+////////////////////////////////////////////////////////////
+//  Entry Point
 
 int main(int argc, const char *argv[]) {
   if (argc != 2) {
     err_msg(ERR_ARGC);
     exit(1);
   }
-  g_listener = launch_listener((uint16_t)atoi(argv[1]));
-
-  g_clients = (t_client *)calloc(FD_SETSIZE, sizeof(t_client));
-  if (!g_clients) {
-    close(g_listener);
-    fatal();
-  }
-  for (int fd = 0; fd < FD_SETSIZE; ++fd) {
-    g_clients[fd].id = -1;
-  }
+  server_init((uint16_t)atoi(argv[1]));
+  clients_init();
   select_loop();
   clean_up();
   return 0;
