@@ -130,23 +130,13 @@ char *xcalloc(size_t count, size_t size) {
   return ptr;
 }
 
-char *xrealloc(char **ptr, size_t size) {
-  if (size == 0) {
-    size = 1;
-  }
-  char *tmp = realloc(*ptr, size);
-  if (!tmp) {
-    fatal();
-  }
-  *ptr = tmp;
-  return tmp;
-}
-
 ////////////////////////////////////////////////////////////
 //  Messaging
 
+bool is_valid_fd(int fd) { return (fd >= 0 && fd < FD_SETSIZE); }
+
 bool is_valid_clientfd(int fd) {
-  return (fd >= 0 && fd < FD_SETSIZE && g_clients[fd].id != -1);
+  return (is_valid_fd(fd) && fd != g_server_fd && g_clients[fd].id != -1);
 }
 
 void broadcast_msg(char *msg, int exclude_fd) {
@@ -154,7 +144,7 @@ void broadcast_msg(char *msg, int exclude_fd) {
     return;
   }
   for (int fd = 0; fd <= g_fdmax; ++fd) {
-    if (fd == g_server_fd || fd == exclude_fd || g_clients[fd].id == -1) {
+    if (fd == exclude_fd || !is_valid_clientfd(fd)) {
       continue;
     }
     char *joined_msg = str_join(g_clients[fd].outbuf, msg);
@@ -228,7 +218,7 @@ void unmonitor(int fd) {
 //  Client Management
 
 void add_client(int client_fd) {
-  if (client_fd < 0 || client_fd >= FD_SETSIZE) {
+  if (!is_valid_fd(client_fd)) {
     return;
   }
   static int next_client_id = 0;
@@ -256,7 +246,6 @@ void remove_client(int client_fd) {
 }
 
 void accept_client() {
-
   int client_fd = accept(g_server_fd, 0, 0);
   if (client_fd == -1) {
     return;
@@ -270,7 +259,7 @@ void accept_client() {
 }
 
 void read_from_client(int fd) {
-  if (fd < 0 || fd >= FD_SETSIZE || g_clients[fd].id == -1) {
+  if (!is_valid_clientfd(fd)) {
     return;
   }
   char buf[4096 + 1];
@@ -285,8 +274,7 @@ void read_from_client(int fd) {
 }
 
 void send_to_client(int fd) {
-  if (fd < 0 || fd >= FD_SETSIZE || g_clients[fd].id == -1 ||
-      !g_clients[fd].outbuf) {
+  if (!is_valid_clientfd(fd) || !g_clients[fd].outbuf) {
     return;
   }
   ssize_t buf_len = strlen(g_clients[fd].outbuf);
